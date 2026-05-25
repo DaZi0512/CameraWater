@@ -1,0 +1,1045 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no" />
+<title>WebGL1 Camera Water Ripple</title>
+<style>
+  html,body{
+    margin:0;
+    width:100%;
+    height:100%;
+    overflow:hidden;
+    background:#050607;
+    touch-action:none;
+    -webkit-user-select:none;
+    user-select:none;
+    font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  }
+  #gl{
+    position:fixed;
+    inset:0;
+    width:100vw;
+    height:100vh;
+    display:block;
+    background:#050607;
+  }
+  video{display:none;}
+  #controls{
+    position:fixed;
+    left:50%;
+    bottom:max(18px,env(safe-area-inset-bottom));
+    transform:translateX(-50%);
+    display:flex;
+    gap:10px;
+    z-index:5;
+    pointer-events:auto;
+  }
+  button{
+    border:1px solid rgba(255,255,255,.28);
+    background:rgba(5,8,12,.46);
+    color:rgba(255,255,255,.92);
+    padding:10px 16px;
+    min-width:96px;
+    border-radius:999px;
+    font-weight:800;
+    letter-spacing:.06em;
+    backdrop-filter:blur(14px);
+    -webkit-backdrop-filter:blur(14px);
+    box-shadow:0 10px 30px rgba(0,0,0,.28);
+  }
+  button.active{
+    background:rgba(255,255,255,.9);
+    color:#07090d;
+  }
+  #switchCam{
+    position:fixed;
+    right:max(14px,env(safe-area-inset-right));
+    top:max(14px,env(safe-area-inset-top));
+    z-index:5;
+    width:46px;
+    min-width:46px;
+    height:46px;
+    padding:0;
+    font-size:22px;
+    line-height:46px;
+  }
+  #error{
+    position:fixed;
+    left:12px;
+    top:max(12px,env(safe-area-inset-top));
+    right:72px;
+    z-index:6;
+    display:none;
+    max-height:42vh;
+    overflow:auto;
+    white-space:pre-wrap;
+    word-break:break-word;
+    color:#ffd6d6;
+    background:rgba(70,0,0,.72);
+    border:1px solid rgba(255,120,120,.55);
+    border-radius:12px;
+    padding:10px 12px;
+    font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    backdrop-filter:blur(10px);
+    -webkit-backdrop-filter:blur(10px);
+  }
+  #hint{
+    position:fixed;
+    left:12px;
+    bottom:calc(max(18px,env(safe-area-inset-bottom)) + 58px);
+    z-index:4;
+    color:rgba(255,255,255,.72);
+    background:rgba(0,0,0,.22);
+    border:1px solid rgba(255,255,255,.12);
+    border-radius:10px;
+    padding:7px 10px;
+    font-size:12px;
+    backdrop-filter:blur(10px);
+    -webkit-backdrop-filter:blur(10px);
+    pointer-events:none;
+  }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<video id="video" autoplay muted playsinline webkit-playsinline></video>
+
+<div id="error"></div>
+<div id="hint">伸开手指并移动指尖：握拳不会触发涟漪</div>
+
+<button id="switchCam" title="切换摄像头">↻</button>
+<div id="controls">
+  <button id="liquidBtn" class="active">LIQUID</button>
+  <button id="crystalBtn">CRYSTAL</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/hands.js"></script>
+<script>
+(() => {
+  "use strict";
+
+  const MAX_TIPS = 10;
+  // 每只手5个指尖。后面会先判断“手指是否伸开”，握拳时不会注入波纹。
+  const FINGER_JOINTS = [
+    {tip:4,  dip:3,  pip:2,  mcp:1,  thumb:1.0},
+    {tip:8,  dip:7,  pip:6,  mcp:5,  thumb:0.0},
+    {tip:12, dip:11, pip:10, mcp:9,  thumb:0.0},
+    {tip:16, dip:15, pip:14, mcp:13, thumb:0.0},
+    {tip:20, dip:19, pip:18, mcp:17, thumb:0.0}
+  ];
+
+  const canvas = document.getElementById("gl");
+  const video = document.getElementById("video");
+  const errorBox = document.getElementById("error");
+  const hint = document.getElementById("hint");
+  const btnLiquid = document.getElementById("liquidBtn");
+  const btnCrystal = document.getElementById("crystalBtn");
+  const btnSwitch = document.getElementById("switchCam");
+
+  let gl;
+  let mode = 0.0;
+  let facingMode = "user";
+  let stream = null;
+  let isFrontCamera = true;
+
+  let simW = 512;
+  let simH = 512;
+  let dpr = 1;
+  let stateA = null;
+  let stateB = null;
+  let readState = null;
+  let writeState = null;
+  let videoTexture = null;
+  let quadBuffer = null;
+
+  let simProgram = null;
+  let renderProgram = null;
+  let copyProgram = null;
+  let simU = {};
+  let renderU = {};
+
+  let halfFloatExt = null;
+  let simTextureType = null;
+
+  let hands = null;
+  let handsReady = false;
+  let handsInitialized = false;
+  let handsSending = false;
+  let handsResetting = false;
+  let handsFailCount = 0;
+  let detectBusy = false;
+  let lastDetectTime = 0;
+
+  const tips = Array.from({length: MAX_TIPS}, () => ({
+    x: 0.5,
+    y: 0.5,
+    px: 0.5,
+    py: 0.5,
+    active: 0,
+    strength: 0,
+    lastSeen: 0
+  }));
+
+  const tipUniform = new Float32Array(MAX_TIPS * 2);
+  const prevUniform = new Float32Array(MAX_TIPS * 2);
+  const activeUniform = new Float32Array(MAX_TIPS);
+  const strengthUniform = new Float32Array(MAX_TIPS);
+
+  function showError(msg) {
+    errorBox.style.display = "block";
+    errorBox.textContent = String(msg || "未知错误");
+    console.error(msg);
+  }
+
+  function clearError() {
+    errorBox.style.display = "none";
+    errorBox.textContent = "";
+  }
+
+  function numberSource(src) {
+    return src.split("\n").map((line, i) => String(i + 1).padStart(3, " ") + " | " + line).join("\n");
+  }
+
+  function initGL() {
+    gl = canvas.getContext("webgl", {
+      alpha: false,
+      antialias: false,
+      depth: false,
+      stencil: false,
+      preserveDrawingBuffer: false,
+      premultipliedAlpha: false
+    });
+
+    if (!gl) {
+      showError("当前浏览器不支持WebGL1。请换Chrome/Safari/Edge移动端浏览器。");
+      return false;
+    }
+
+    gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.CULL_FACE);
+    gl.disable(gl.BLEND);
+
+    halfFloatExt = gl.getExtension("OES_texture_half_float");
+    const halfColor = gl.getExtension("EXT_color_buffer_half_float");
+    const floatExt = gl.getExtension("OES_texture_float");
+    const floatColor = gl.getExtension("WEBGL_color_buffer_float") || gl.getExtension("EXT_color_buffer_float");
+
+    if (halfFloatExt && halfColor) {
+      simTextureType = halfFloatExt.HALF_FLOAT_OES;
+    } else if (floatExt && floatColor) {
+      simTextureType = gl.FLOAT;
+    } else {
+      simTextureType = gl.UNSIGNED_BYTE;
+    }
+
+    quadBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+    gl.bufferData(
+      gl.ARRAY_BUFFER,
+      new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]),
+      gl.STATIC_DRAW
+    );
+
+    videoTexture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const black = new Uint8Array([0, 0, 0, 255]);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, black);
+
+    simProgram = makeProgram(VERT, SIM_FRAG, "wave simulation shader");
+    renderProgram = makeProgram(VERT, RENDER_FRAG, "final render shader");
+    if (!simProgram || !renderProgram) return false;
+
+    simU = {
+      state: gl.getUniformLocation(simProgram, "uState"),
+      texel: gl.getUniformLocation(simProgram, "uTexel"),
+      aspect: gl.getUniformLocation(simProgram, "uAspect"),
+      time: gl.getUniformLocation(simProgram, "uTime"),
+      mode: gl.getUniformLocation(simProgram, "uMode"),
+      tip: gl.getUniformLocation(simProgram, "uTip[0]"),
+      prev: gl.getUniformLocation(simProgram, "uPrevTip[0]"),
+      active: gl.getUniformLocation(simProgram, "uTipActive[0]"),
+      strength: gl.getUniformLocation(simProgram, "uTipStrength[0]")
+    };
+
+    renderU = {
+      state: gl.getUniformLocation(renderProgram, "uState"),
+      video: gl.getUniformLocation(renderProgram, "uVideo"),
+      texel: gl.getUniformLocation(renderProgram, "uTexel"),
+      resolution: gl.getUniformLocation(renderProgram, "uResolution"),
+      videoResolution: gl.getUniformLocation(renderProgram, "uVideoResolution"),
+      mirror: gl.getUniformLocation(renderProgram, "uMirror"),
+      mode: gl.getUniformLocation(renderProgram, "uMode"),
+      time: gl.getUniformLocation(renderProgram, "uTime")
+    };
+
+    resize();
+    return true;
+  }
+
+  function compile(type, src, label) {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      const info = gl.getShaderInfoLog(sh) || "无详细日志";
+      const kind = type === gl.VERTEX_SHADER ? "Vertex" : "Fragment";
+      showError(kind + " shader编译失败：" + label + "\n\n" + info + "\n\n" + numberSource(src));
+      gl.deleteShader(sh);
+      return null;
+    }
+    return sh;
+  }
+
+  function makeProgram(vsSrc, fsSrc, label) {
+    const vs = compile(gl.VERTEX_SHADER, vsSrc, label);
+    const fs = compile(gl.FRAGMENT_SHADER, fsSrc, label);
+    if (!vs || !fs) return null;
+
+    const p = gl.createProgram();
+    gl.attachShader(p, vs);
+    gl.attachShader(p, fs);
+    gl.linkProgram(p);
+
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      showError("Shader链接失败：" + label + "\n\n" + (gl.getProgramInfoLog(p) || "无详细日志"));
+      gl.deleteProgram(p);
+      return null;
+    }
+    return p;
+  }
+
+  function bindQuad(program) {
+    const loc = gl.getAttribLocation(program, "aPos");
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  }
+
+  function makeStateTexture(w, h) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, simTextureType, null);
+
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+
+    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if (ok !== gl.FRAMEBUFFER_COMPLETE) {
+      showError("FBO创建失败，状态码：" + ok + "\n当前设备可能不支持半浮点/浮点渲染。");
+    }
+
+    return {tex, fbo, w, h};
+  }
+
+  function clearState(target) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
+    gl.viewport(0, 0, target.w, target.h);
+    gl.clearColor(0.5, 0.5, 0.5, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+
+  function recreateStates() {
+    if (stateA) {
+      gl.deleteTexture(stateA.tex);
+      gl.deleteFramebuffer(stateA.fbo);
+      gl.deleteTexture(stateB.tex);
+      gl.deleteFramebuffer(stateB.fbo);
+    }
+    stateA = makeStateTexture(simW, simH);
+    stateB = makeStateTexture(simW, simH);
+    clearState(stateA);
+    clearState(stateB);
+    readState = stateA;
+    writeState = stateB;
+  }
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = Math.max(1, Math.floor(window.innerWidth * dpr));
+    const h = Math.max(1, Math.floor(window.innerHeight * dpr));
+
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+
+      const aspect = w / h;
+      const base = Math.min(860, Math.max(360, Math.floor(Math.min(w, h) * 0.82)));
+      if (aspect >= 1) {
+        simH = base;
+        simW = Math.min(960, Math.max(360, Math.floor(base * aspect)));
+      } else {
+        simW = base;
+        simH = Math.min(960, Math.max(360, Math.floor(base / aspect)));
+      }
+      recreateStates();
+    }
+  }
+
+  async function startCamera() {
+    clearError();
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      showError("浏览器不支持getUserMedia。请使用Chrome/Safari/Edge，并通过https或localhost打开。");
+      return;
+    }
+
+    if (location.protocol === "file:") {
+      showError("当前是file://打开，摄像头权限通常不会正常弹出。\n请用localhost或https打开，例如：python -m http.server 5173");
+    }
+
+    if (stream) {
+      stream.getTracks().forEach(t => t.stop());
+      stream = null;
+    }
+
+    const constraints = {
+      audio: false,
+      video: {
+        facingMode: facingMode,
+        width: {ideal: 1280},
+        height: {ideal: 720},
+        frameRate: {ideal: 30, max: 60}
+      }
+    };
+
+    try {
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
+      video.srcObject = stream;
+      await video.play();
+      await waitForVideoReady();
+
+      isFrontCamera = facingMode === "user";
+      hint.textContent = isFrontCamera ? "前摄像头已镜像：伸开并移动指尖制造水纹" : "后摄像头：伸开并移动指尖制造水纹";
+
+      const handOk = await initHands();
+      if (!handOk) return;
+      if (!detectBusy) {
+        detectBusy = true;
+        requestAnimationFrame(detectLoop);
+      }
+    } catch (err) {
+      showError(
+        "摄像头启动失败：\n" + (err && err.name ? err.name + ": " : "") + (err && err.message ? err.message : err) +
+        "\n\n解决办法：\n1.不要直接双击HTML，用http://localhost或https打开。\n2.浏览器地址栏允许摄像头权限。\n3.手机浏览器建议使用Chrome/Safari，并确认不是无痕/受限模式。"
+      );
+    }
+  }
+
+  function waitForVideoReady() {
+    if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve, reject) => {
+      const start = performance.now();
+      const tick = () => {
+        if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+          resolve();
+          return;
+        }
+        if (performance.now() - start > 5000) {
+          reject(new Error("摄像头视频帧超时，未拿到可用videoWidth/videoHeight"));
+          return;
+        }
+        requestAnimationFrame(tick);
+      };
+      tick();
+    });
+  }
+
+  async function initHands() {
+    if (handsReady && handsInitialized && hands) return true;
+    if (typeof Hands === "undefined") {
+      showError("MediaPipe Hands加载失败。请检查网络是否能访问：\nhttps://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/");
+      return false;
+    }
+
+    try {
+      hands = new Hands({
+        locateFile: file => "https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/" + file
+      });
+
+      hands.setOptions({
+        maxNumHands: 2,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.62,
+        minTrackingConfidence: 0.55
+      });
+
+      hands.onResults(onHandsResults);
+
+      // 关键修复1：显式初始化。否则部分浏览器会在hands.send阶段才懒加载wasm/model，
+      // 容易出现 Cannot read properties of undefined (reading 'buffer')。
+      if (typeof hands.initialize === "function") {
+        await hands.initialize();
+      }
+
+      handsReady = true;
+      handsInitialized = true;
+      handsFailCount = 0;
+      clearError();
+      return true;
+    } catch (err) {
+      handsReady = false;
+      handsInitialized = false;
+      showError(
+        "MediaPipe Hands初始化失败：\n" + (err && err.message ? err.message : err) +
+        "\n\n这通常是hands wasm/model文件没加载完整。请刷新页面，或确认CDN可访问：\nhttps://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/"
+      );
+      return false;
+    }
+  }
+
+  async function resetHands() {
+    if (handsResetting) return;
+    handsResetting = true;
+    handsReady = false;
+    handsInitialized = false;
+    handsSending = false;
+    try {
+      if (hands && typeof hands.close === "function") await hands.close();
+    } catch (e) {}
+    hands = null;
+    await initHands();
+    handsResetting = false;
+  }
+
+  function videoToScreenUV(xVideoDisplayed, yVideoTop) {
+    const vw = video.videoWidth || 1280;
+    const vh = video.videoHeight || 720;
+    const va = vw / vh;
+    const ca = canvas.width / canvas.height;
+
+    let sx = xVideoDisplayed;
+    let syTop = yVideoTop;
+
+    if (ca > va) {
+      syTop = (yVideoTop - 0.5) * (ca / va) + 0.5;
+    } else {
+      sx = (xVideoDisplayed - 0.5) * (va / ca) + 0.5;
+    }
+
+    return [sx, 1.0 - syTop];
+  }
+
+  function lmDist2(a, b) {
+    const dx = a.x - b.x;
+    const dy = a.y - b.y;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+
+  function smooth01(edge0, edge1, x) {
+    const t = clamp01((x - edge0) / Math.max(edge1 - edge0, 1e-6));
+    return t * t * (3.0 - 2.0 * t);
+  }
+
+  function palmInfo(hand) {
+    const ids = [0, 5, 9, 13, 17];
+    let x = 0.0;
+    let y = 0.0;
+    for (let i = 0; i < ids.length; i++) {
+      x += hand[ids[i]].x;
+      y += hand[ids[i]].y;
+    }
+    const center = {x: x / ids.length, y: y / ids.length};
+    const wrist = hand[0];
+    const scale = Math.max(0.035,
+      0.55 * lmDist2(wrist, hand[9]) +
+      0.30 * lmDist2(hand[5], hand[17]) +
+      0.15 * lmDist2(hand[5], hand[9])
+    );
+    return {center, scale};
+  }
+
+  function fingerOpenScore(hand, joint, palm) {
+    const tip = hand[joint.tip];
+    const dip = hand[joint.dip];
+    const pip = hand[joint.pip];
+    const mcp = hand[joint.mcp];
+
+    const tipPalm = lmDist2(tip, palm.center);
+    const pipPalm = lmDist2(pip, palm.center);
+    const tipMcp = lmDist2(tip, mcp);
+    const pipMcp = lmDist2(pip, mcp);
+
+    const ux = tip.x - dip.x;
+    const uy = tip.y - dip.y;
+    const vx = dip.x - pip.x;
+    const vy = dip.y - pip.y;
+    const alignment = (ux * vx + uy * vy) / (Math.sqrt(ux * ux + uy * uy) * Math.sqrt(vx * vx + vy * vy) + 1e-6);
+
+    // 非拇指：指尖要明显远离掌心，并且tip-mcp长度要大于pip-mcp。
+    // 握拳时MediaPipe仍会给出tip坐标，但这些坐标靠近掌心，会被这里过滤。
+    const normalLength = smooth01(0.58, 0.94, tipMcp / palm.scale);
+    const normalOutward = smooth01(1.04, 1.24, tipPalm / Math.max(pipPalm, 1e-6));
+    const normalStraight = smooth01(-0.15, 0.38, alignment);
+
+    // 拇指横向活动大，不能完全照搬其它四指，所以阈值略放宽，但仍要求远离掌心。
+    const thumbLength = smooth01(0.50, 0.86, tipMcp / palm.scale);
+    const thumbOutward = smooth01(1.02, 1.18, tipPalm / Math.max(pipPalm, 1e-6));
+
+    const normalScore = normalLength * normalOutward * (0.72 + 0.28 * normalStraight);
+    const thumbScore = thumbLength * thumbOutward;
+
+    return joint.thumb > 0.5 ? thumbScore : normalScore;
+  }
+
+  function onHandsResults(results) {
+    const now = performance.now() * 0.001;
+    let index = 0;
+
+    const allHands = results && results.multiHandLandmarks ? results.multiHandLandmarks : [];
+    for (let h = 0; h < allHands.length && index < MAX_TIPS; h++) {
+      const hand = allHands[h];
+      const palm = palmInfo(hand);
+
+      for (let k = 0; k < FINGER_JOINTS.length && index < MAX_TIPS; k++) {
+        const joint = FINGER_JOINTS[k];
+        const lm = hand[joint.tip];
+        const xDisplayed = isFrontCamera ? 1.0 - lm.x : lm.x;
+        const uv = videoToScreenUV(xDisplayed, lm.y);
+
+        const insideX = step01(uv[0]) * step01(1.0 - uv[0]);
+        const insideY = step01(uv[1]) * step01(1.0 - uv[1]);
+        const inside = insideX * insideY;
+
+        const t = tips[index];
+        const oldX = t.x;
+        const oldY = t.y;
+        const rawDx = uv[0] - oldX;
+        const rawDy = uv[1] - oldY;
+        const rawSpeed = Math.sqrt(rawDx * rawDx + rawDy * rawDy);
+
+        const openScore = fingerOpenScore(hand, joint, palm);
+        const openGate = smooth01(0.42, 0.70, openScore);
+
+        // 关键修改：必须是“伸开的指尖 + 发生移动”才注入波纹。
+        // 这样握拳、手掌、关节、误识别点不会产生大面积波纹。
+        const motionGate = smooth01(0.0018, 0.016, rawSpeed);
+        const close = clamp01((-lm.z - 0.010) / 0.105);
+        const gate = inside * openGate * motionGate;
+
+        if (gate < 0.025 || t.active < 0.04) {
+          t.px = uv[0];
+          t.py = uv[1];
+        } else {
+          t.px = oldX;
+          t.py = oldY;
+        }
+
+        t.x = uv[0];
+        t.y = uv[1];
+
+        const dx = t.x - t.px;
+        const dy = t.y - t.py;
+        const speed = Math.sqrt(dx * dx + dy * dy);
+
+        t.active = gate;
+        t.strength = gate * clamp01(0.14 + close * 0.20 + speed * 24.0);
+        t.lastSeen = now;
+
+        index++;
+      }
+    }
+
+    for (; index < MAX_TIPS; index++) {
+      tips[index].active *= 0.72;
+      tips[index].strength *= 0.68;
+    }
+  }
+
+  function step01(v) {
+    return v >= 0 ? 1 : 0;
+  }
+
+  function clamp01(v) {
+    return Math.max(0, Math.min(1, v));
+  }
+
+  async function detectLoop(t) {
+    requestAnimationFrame(detectLoop);
+
+    if (!handsReady || !hands || handsResetting || !video.videoWidth || !video.videoHeight || video.readyState < 2) return;
+
+    const minInterval = 1000 / 24;
+    if (t - lastDetectTime < minInterval) return;
+
+    // 关键修复2：MediaPipe Solution不是可重入的，上一帧没处理完时不能继续send。
+    // 旧版本会因为并发send触发内部buffer为undefined。
+    if (handsSending) return;
+
+    lastDetectTime = t;
+    handsSending = true;
+
+    try {
+      await hands.send({image: video});
+      handsFailCount = 0;
+      if (errorBox.textContent.indexOf("MediaPipe Hands运行失败") === 0) clearError();
+    } catch (err) {
+      handsFailCount += 1;
+      const msg = err && err.message ? err.message : String(err);
+      console.warn("MediaPipe Hands运行失败：", msg);
+
+      // 偶发首帧错误不直接打断画面；连续失败才提示。
+      if (handsFailCount >= 3) {
+        showError(
+          "MediaPipe Hands运行失败：\n" + msg +
+          "\n\n已自动尝试重置手势识别。若仍失败，多半是CDN模型/wasm没有完整加载，刷新页面或换Chrome/Safari再试。"
+        );
+        resetHands();
+      }
+    } finally {
+      handsSending = false;
+    }
+  }
+
+  function updateVideoTexture() {
+    if (!video.videoWidth || video.readyState < 2) return;
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    try {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+    } catch (err) {
+      // 有些浏览器在视频第一帧尚未准备好时会短暂报错，忽略即可。
+    }
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  }
+
+  function fillTipUniforms() {
+    for (let i = 0; i < MAX_TIPS; i++) {
+      const t = tips[i];
+      tipUniform[i * 2] = t.x;
+      tipUniform[i * 2 + 1] = t.y;
+      prevUniform[i * 2] = t.px;
+      prevUniform[i * 2 + 1] = t.py;
+      activeUniform[i] = t.active;
+      strengthUniform[i] = t.strength;
+    }
+  }
+
+  function simStep(timeSec) {
+    fillTipUniforms();
+
+    gl.useProgram(simProgram);
+    bindQuad(simProgram);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, writeState.fbo);
+    gl.viewport(0, 0, simW, simH);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, readState.tex);
+    gl.uniform1i(simU.state, 0);
+    gl.uniform2f(simU.texel, 1 / simW, 1 / simH);
+    gl.uniform1f(simU.aspect, simW / simH);
+    gl.uniform1f(simU.time, timeSec);
+    gl.uniform1f(simU.mode, mode);
+    gl.uniform2fv(simU.tip, tipUniform);
+    gl.uniform2fv(simU.prev, prevUniform);
+    gl.uniform1fv(simU.active, activeUniform);
+    gl.uniform1fv(simU.strength, strengthUniform);
+
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    const tmp = readState;
+    readState = writeState;
+    writeState = tmp;
+  }
+
+  function render(timeSec) {
+    resize();
+    updateVideoTexture();
+
+    // 两次子步进，涟漪扩散更顺，手机上仍然是WebGL1负载。
+    simStep(timeSec);
+    simStep(timeSec + 0.004);
+
+    gl.useProgram(renderProgram);
+    bindQuad(renderProgram);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, readState.tex);
+    gl.uniform1i(renderU.state, 0);
+
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+    gl.uniform1i(renderU.video, 1);
+
+    gl.uniform2f(renderU.texel, 1 / simW, 1 / simH);
+    gl.uniform2f(renderU.resolution, canvas.width, canvas.height);
+    gl.uniform2f(renderU.videoResolution, video.videoWidth || 1280, video.videoHeight || 720);
+    gl.uniform1f(renderU.mirror, isFrontCamera ? 1.0 : 0.0);
+    gl.uniform1f(renderU.mode, mode);
+    gl.uniform1f(renderU.time, timeSec);
+
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    requestAnimationFrame(t => render(t * 0.001));
+  }
+
+  btnLiquid.addEventListener("click", () => {
+    mode = 0.0;
+    btnLiquid.classList.add("active");
+    btnCrystal.classList.remove("active");
+  });
+
+  btnCrystal.addEventListener("click", () => {
+    mode = 1.0;
+    btnCrystal.classList.add("active");
+    btnLiquid.classList.remove("active");
+  });
+
+  btnSwitch.addEventListener("click", async () => {
+    facingMode = facingMode === "user" ? "environment" : "user";
+    for (const t of tips) {
+      t.active = 0;
+      t.strength = 0;
+    }
+    await startCamera();
+  });
+
+  window.addEventListener("resize", resize, {passive: true});
+
+  window.addEventListener("pointerdown", () => {
+    if (!stream) startCamera();
+  }, {passive: true});
+
+  const VERT = `
+attribute vec2 aPos;
+varying vec2 vUv;
+void main(){
+  vUv = aPos * 0.5 + 0.5;
+  gl_Position = vec4(aPos, 0.0, 1.0);
+}
+`;
+
+  const SIM_FRAG = `
+precision highp float;
+
+varying vec2 vUv;
+
+uniform sampler2D uState;
+uniform vec2 uTexel;
+uniform float uAspect;
+uniform float uTime;
+uniform float uMode;
+
+uniform vec2 uTip[10];
+uniform vec2 uPrevTip[10];
+uniform float uTipActive[10];
+uniform float uTipStrength[10];
+
+float decodeH(vec4 c){
+  return c.r * 2.0 - 1.0;
+}
+
+float decodePrev(vec4 c){
+  return c.g * 2.0 - 1.0;
+}
+
+float capsuleSDF(vec2 p, vec2 a, vec2 b, float r){
+  vec2 pa = p - a;
+  vec2 ba = b - a;
+  float h = clamp(dot(pa, ba) / (dot(ba, ba) + 1e-5), 0.0, 1.0);
+  return length(pa - ba * h) - r;
+}
+
+void main(){
+  vec2 e = uTexel;
+
+  vec4 c0 = texture2D(uState, vUv);
+  float h  = decodeH(c0);
+  float hp = decodePrev(c0);
+
+  float hL  = decodeH(texture2D(uState, vUv + vec2(-e.x, 0.0)));
+  float hR  = decodeH(texture2D(uState, vUv + vec2( e.x, 0.0)));
+  float hB  = decodeH(texture2D(uState, vUv + vec2(0.0, -e.y)));
+  float hT  = decodeH(texture2D(uState, vUv + vec2(0.0,  e.y)));
+
+  float hLB = decodeH(texture2D(uState, vUv + vec2(-e.x, -e.y)));
+  float hRB = decodeH(texture2D(uState, vUv + vec2( e.x, -e.y)));
+  float hLT = decodeH(texture2D(uState, vUv + vec2(-e.x,  e.y)));
+  float hRT = decodeH(texture2D(uState, vUv + vec2( e.x,  e.y)));
+
+  // 9-tap isotropic Laplacian: 比4邻域更不容易出现方形波纹。
+  float lap = (4.0 * (hL + hR + hB + hT) + (hLB + hRB + hLT + hRT) - 20.0 * h) * 0.1666667;
+
+  float speed = mix(0.50, 0.62, uMode);
+  float nextH = 2.0 * h - hp + lap * speed;
+
+  // 非线性衰减：小振幅衰减快，大振幅衰减慢。
+  float amp = abs(h);
+  float inertia = smoothstep(0.018, 0.18, amp);
+  float dampingSmall = mix(0.942, 0.934, uMode);
+  float dampingLarge = mix(0.988, 0.982, uMode);
+  float damping = mix(dampingSmall, dampingLarge, inertia);
+  nextH *= damping;
+
+  vec2 p = vec2(vUv.x * uAspect, vUv.y);
+  float impulse = 0.0;
+
+  for(int i = 0; i < 10; i++){
+    vec2 a = vec2(uPrevTip[i].x * uAspect, uPrevTip[i].y);
+    vec2 b = vec2(uTip[i].x * uAspect, uTip[i].y);
+    float s = clamp(uTipStrength[i], 0.0, 1.0);
+    float r = mix(0.008, 0.023, s) + uMode * 0.003;
+
+    float d = capsuleSDF(p, a, b, r);
+    float core = exp(-(d * d) / (r * r + 1e-5));
+    float wide = exp(-(d * d) / (r * r * 5.8 + 1e-5));
+    float ringBias = core - 0.26 * wide;
+
+    // 低频扰动让静止指尖也有轻微“贴在水膜上”的感觉。
+    float pulse = 0.78 + 0.22 * sin(uTime * 9.0 + float(i) * 1.73);
+    impulse += uTipActive[i] * s * ringBias * pulse;
+  }
+
+  nextH += impulse * mix(0.035, 0.048, uMode);
+
+  // 边界吸收，减少墙面反弹。
+  vec2 edge = smoothstep(vec2(0.0), vec2(0.055), vUv) * smoothstep(vec2(0.0), vec2(0.055), 1.0 - vUv);
+  float edgeFade = edge.x * edge.y;
+  nextH *= mix(0.86, 1.0, edgeFade);
+
+  nextH = clamp(nextH, -0.82, 0.82);
+
+  gl_FragColor = vec4(nextH * 0.5 + 0.5, h * 0.5 + 0.5, lap * 0.5 + 0.5, 1.0);
+}
+`;
+
+  const RENDER_FRAG = `
+precision highp float;
+
+varying vec2 vUv;
+
+uniform sampler2D uState;
+uniform sampler2D uVideo;
+uniform vec2 uTexel;
+uniform vec2 uResolution;
+uniform vec2 uVideoResolution;
+uniform float uMirror;
+uniform float uMode;
+uniform float uTime;
+
+float decodeH(vec4 c){
+  return c.r * 2.0 - 1.0;
+}
+
+vec2 coverUV(vec2 uv){
+  float ca = uResolution.x / max(uResolution.y, 1.0);
+  float va = uVideoResolution.x / max(uVideoResolution.y, 1.0);
+
+  vec2 videoWide = vec2((uv.x - 0.5) * (ca / va) + 0.5, uv.y);
+  vec2 canvasWide = vec2(uv.x, (uv.y - 0.5) * (va / ca) + 0.5);
+  float canvasIsWide = step(va, ca);
+
+  vec2 outUV = mix(videoWide, canvasWide, canvasIsWide);
+  outUV.x = mix(outUV.x, 1.0 - outUV.x, uMirror);
+  return clamp(outUV, 0.001, 0.999);
+}
+
+vec3 videoSample(vec2 uv){
+  return texture2D(uVideo, coverUV(uv)).rgb;
+}
+
+void main(){
+  vec2 e = uTexel;
+
+  float h  = decodeH(texture2D(uState, vUv));
+  float hL = decodeH(texture2D(uState, vUv + vec2(-e.x, 0.0)));
+  float hR = decodeH(texture2D(uState, vUv + vec2( e.x, 0.0)));
+  float hB = decodeH(texture2D(uState, vUv + vec2(0.0, -e.y)));
+  float hT = decodeH(texture2D(uState, vUv + vec2(0.0,  e.y)));
+
+  float hLB = decodeH(texture2D(uState, vUv + vec2(-e.x, -e.y)));
+  float hRB = decodeH(texture2D(uState, vUv + vec2( e.x, -e.y)));
+  float hLT = decodeH(texture2D(uState, vUv + vec2(-e.x,  e.y)));
+  float hRT = decodeH(texture2D(uState, vUv + vec2( e.x,  e.y)));
+
+  vec2 grad = vec2(hR - hL, hT - hB);
+  float lap = (4.0 * (hL + hR + hB + hT) + (hLB + hRB + hLT + hRT) - 20.0 * h) * 0.1666667;
+
+  // 折射：直接使用坡度grad，不归一化；坡越陡，偏移越大。
+  float refractScale = mix(0.072, 0.092, uMode);
+  float lensScale = mix(0.082, 0.116, uMode);
+
+  // Laplacian曲率项：波峰/波谷有局部放大镜式变形。
+  vec2 offset = grad * refractScale + grad * lap * lensScale;
+
+  float chroma = mix(0.42, 0.72, uMode);
+  vec3 col;
+  col.r = videoSample(vUv + offset * (1.0 + 0.90 * chroma)).r;
+  col.g = videoSample(vUv + offset).g;
+  col.b = videoSample(vUv + offset * (1.0 - 0.55 * chroma)).b;
+
+  vec3 normal = normalize(vec3(-grad.x * 34.0, -grad.y * 34.0, 1.0));
+  vec3 viewDir = vec3(0.0, 0.0, 1.0);
+  vec3 lightDir = normalize(vec3(-0.42, 0.52, 0.74));
+  vec3 halfDir = normalize(lightDir + viewDir);
+
+  // Schlick Fresnel：掠射角反光更强。
+  float ndv = clamp(dot(normal, viewDir), 0.0, 1.0);
+  float fresnel = 0.035 + (1.0 - 0.035) * pow(1.0 - ndv, 5.0);
+
+  // 双瓣高光：尖锐specular + 宽sheen。
+  float ndh = max(dot(normal, halfDir), 0.0);
+  float sharpSpec = pow(ndh, mix(90.0, 150.0, uMode));
+  float broadSheen = pow(max(dot(normal, lightDir), 0.0), mix(8.0, 14.0, uMode));
+
+  float slope = length(grad);
+  float rim = smoothstep(0.028, 0.135, slope) + smoothstep(0.044, 0.160, abs(lap));
+
+  vec3 warm = vec3(1.0, 0.38, 0.18);
+  vec3 cold = vec3(0.12, 0.34, 0.92);
+
+  // 波深明暗：波峰暖亮，波谷冷暗；幅度控制得比较克制，避免整片蓝/黄污染画面。
+  col += warm * max(h, 0.0) * mix(0.22, 0.32, uMode);
+  col -= cold * max(-h, 0.0) * mix(0.10, 0.15, uMode);
+
+  vec3 reflectTint = mix(vec3(0.82, 0.95, 1.0), vec3(1.0, 0.82, 0.72), smoothstep(0.0, 0.16, h));
+  col += reflectTint * fresnel * mix(0.42, 0.58, uMode);
+  col += vec3(1.0, 0.92, 0.78) * sharpSpec * mix(1.18, 1.62, uMode);
+  col += vec3(0.80, 0.92, 1.0) * broadSheen * mix(0.14, 0.22, uMode);
+
+  // 类似参考图的银白水膜边缘，但不做半透明覆盖。
+  vec3 edgeWhite = mix(vec3(0.92, 1.0, 1.0), vec3(1.0, 0.86, 0.78), uMode);
+  col += edgeWhite * rim * mix(0.13, 0.23, uMode);
+
+  // 轻微暗角，把注意力压到手和水纹区域。
+  vec2 q = vUv - 0.5;
+  float vignette = smoothstep(0.88, 0.20, dot(q, q));
+  col *= mix(0.82, 1.05, vignette);
+
+  // 细小晶体折线感，只在CRYSTAL模式增强。
+  float crystalLine = sin((vUv.x + vUv.y) * 720.0 + h * 80.0 + uTime * 0.65);
+  col += vec3(1.0) * smoothstep(0.985, 1.0, crystalLine) * uMode * rim * 0.16;
+
+  col = pow(max(col, 0.0), vec3(0.96));
+  gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+}
+`;
+
+  if (initGL()) {
+    startCamera();
+    requestAnimationFrame(t => render(t * 0.001));
+  }
+})();
+</script>
+</body>
+</html>
