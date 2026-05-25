@@ -1,4 +1,3 @@
-# CameraWater
 # WebGL Camera Water Ripple
 
 这是一个基于浏览器摄像头的实时水波纹交互效果项目。
